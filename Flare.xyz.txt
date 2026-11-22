@@ -1,0 +1,208 @@
+-- flare.xyz | Deepwoken AC surface
+-- drop this above the main hub load or require it first.
+-- goal: keep the original automation logic, kill the fingerprints that get people banned.
+
+local genv = getgenv()
+local services = setmetatable({}, {
+    __index = function(t, k)
+        local ok, s = pcall(game.GetService, game, k)
+        if ok then t[k] = s return s end
+    end
+})
+
+-- 1. silent by default + no CoreGui name leaks
+genv.flare_silent = true
+pcall(function()
+    if not isfile("Flare.xyz/silent_mode_toggle") then
+        writefile("Flare.xyz/silent_mode_toggle", "1")
+    end
+end)
+
+-- 2. random delay helper (breaks timing signatures)
+local function jitter(min, max)
+    task.wait(min + math.random() * (max - min))
+end
+
+-- 3. safe FireServer wrapper — rate limit + small jitter
+local last_fire = {}
+local function safe_fire(remote, ...)
+    if not remote or not remote.FireServer then return end
+    local key = tostring(remote)
+    local now = tick()
+    if last_fire[key] and now - last_fire[key] < 0.12 then
+        jitter(0.08, 0.18)
+    end
+    last_fire[key] = tick()
+    return remote:FireServer(...)
+end
+
+-- 4. proximity prompt wrap that still fires the signal but never spams
+local real_firepp = fireproximityprompt
+genv.flare_firepp = function(prompt, ...)
+    if not prompt or not prompt:IsA("ProximityPrompt") then return end
+    local fired = false
+    local conn = services.ProximityPromptService.PromptTriggered:Once(function()
+        fired = true
+    end)
+    local ok, res = pcall(real_firepp, prompt, ...)
+    conn:Disconnect()
+    if not fired then
+        pcall(firesignal, services.ProximityPromptService.PromptTriggered, prompt, services.Players.LocalPlayer)
+    end
+    jitter(0.05, 0.15)
+    return ok and res
+end
+-- alias so the rest of the hub uses the safe version
+if not getgenv().original_fireproximityprompt then
+    getgenv().original_fireproximityprompt = fireproximityprompt
+    fireproximityprompt = genv.flare_firepp
+end
+
+-- 5. hop that looks like a normal disconnect, not a panic hop
+local function clean_hop(slot, force)
+    slot = slot or (services.Players.LocalPlayer:GetAttribute("DataSlot") or "A")
+    -- small random wait so it doesn't look scripted
+    jitter(1.2, 3.5)
+    if genv.server_utility and genv.server_utility.hop then
+        return genv.server_utility.hop(slot, true, force)
+    end
+    -- fallback: teleport service leave + rejoin style
+    pcall(function()
+        services.TeleportService:Teleport(game.PlaceId, services.Players.LocalPlayer)
+    end)
+end
+genv.flare_clean_hop = clean_hop
+
+-- 6. player proximity check with hysteresis (no instant hop on one frame)
+local near_streak = 0
+local function players_too_close(radius, pos)
+    radius = radius or 220
+    pos = pos or (services.Players.LocalPlayer.Character and services.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart") and services.Players.LocalPlayer.Character.HumanoidRootPart.Position)
+    if not pos then return false end
+    local count = 0
+    for _, plr in ipairs(services.Players:GetPlayers()) do
+        if plr ~= services.Players.LocalPlayer and plr.Character then
+            local hrp = plr.Character:FindFirstChild("HumanoidRootPart")
+            if hrp and (hrp.Position - pos).Magnitude <= radius then
+                count += 1
+            end
+        end
+    end
+    if count > 0 then
+        near_streak += 1
+    else
+        near_streak = math.max(0, near_streak - 1)
+    end
+    return near_streak >= 4 -- require a few consecutive checks
+end
+genv.flare_players_near = players_too_close
+
+-- 7. velocity / CFrame movement that stays under common AC thresholds
+local function safe_tween(cf, speed)
+    speed = speed or 180
+    -- never exceed ~220 studs/s sustained; random micro-jitters
+    local root = services.Players.LocalPlayer.Character and services.Players.LocalPlayer.Character:FindFirstChild("HumanoidRootPart")
+    if not root then return end
+    local start = root.CFrame
+    local dist = (cf.Position - start.Position).Magnitude
+    local time = math.clamp(dist / speed, 0.35, 8)
+    local steps = math.max(8, math.floor(time * 30))
+    for i = 1, steps do
+        if not root.Parent then break end
+        local alpha = i / steps
+        -- slight noise so it isn't a perfect line
+        local noise = Vector3.new(
+            (math.random() - 0.5) * 0.4,
+            (math.random() - 0.5) * 0.2,
+            (math.random() - 0.5) * 0.4
+        )
+        root.CFrame = start:Lerp(cf, alpha) + noise
+        task.wait(time / steps)
+        if players_too_close(200, root.Position) then
+            clean_hop()
+            return
+        end
+    end
+    root.CFrame = cf
+end
+genv.flare_safe_tween = safe_tween
+
+-- 8. kill obvious UI markers if any leaked
+pcall(function()
+    for _, gui in ipairs(services.CoreGui:GetChildren()) do
+        if gui.Name:lower():find("rain") or gui.Name:lower():find("project") or gui.Name:lower():find("aztup") then
+            gui.Name = "RobloxGui" -- bland
+        end
+    end
+end)
+
+-- 9. keep-alive that doesn't spam Unknown key (some ACs flag pure Unknown)
+task.spawn(function()
+    local vim = Instance.new("VirtualInputManager")
+    while task.wait(math.random(95, 140)) do
+        -- occasional real-looking input instead of pure Unknown
+        local key = ({Enum.KeyCode.W, Enum.KeyCode.A, Enum.KeyCode.S, Enum.KeyCode.D, Enum.KeyCode.LeftShift})[math.random(1, 5)]
+        vim:SendKeyEvent(true, key, false, game)
+        task.wait(0.05 + math.random() * 0.1)
+        vim:SendKeyEvent(false, key, false, game)
+    end
+end)
+
+-- 10. effect replicator guard — if Danger or similar pops, hop instead of fighting
+task.spawn(function()
+    while task.wait(1.5) do
+        if genv.EffectReplicator and genv.EffectReplicator.HasEffect then
+            if genv.EffectReplicator:HasEffect("Danger") or genv.EffectReplicator:HasEffect("Combat") then
+                if players_too_close(350) then
+                    clean_hop()
+                end
+            end
+        end
+    end
+end)
+
+-- 11. remote name cache so we never index by string every frame
+genv.flare_remotes = genv.flare_remotes or {}
+local function get_remote(path)
+    if genv.flare_remotes[path] and genv.flare_remotes[path].Parent then
+        return genv.flare_remotes[path]
+    end
+    local cur = services.ReplicatedStorage
+    for part in string.gmatch(path, "[^%.]+") do
+        cur = cur:FindFirstChild(part)
+        if not cur then return nil end
+    end
+    genv.flare_remotes[path] = cur
+    return cur
+end
+genv.flare_get_remote = get_remote
+
+-- 12. final safety: if the hub tries to write "Project Rain" anywhere, redirect
+local old_writefile = writefile
+writefile = function(path, data)
+    if typeof(path) == "string" then
+        path = path:gsub("Project Rain", "Flare.xyz"):gsub("Project%_Rain", "Flare.xyz")
+    end
+    return old_writefile(path, data)
+end
+local old_isfile = isfile
+isfile = function(path)
+    if typeof(path) == "string" then
+        path = path:gsub("Project Rain", "Flare.xyz"):gsub("Project%_Rain", "Flare.xyz")
+    end
+    return old_isfile(path)
+end
+
+-- expose for the main script
+genv.flare_ac = {
+    safe_fire = safe_fire,
+    firepp = genv.flare_firepp,
+    hop = clean_hop,
+    players_near = players_too_close,
+    tween = safe_tween,
+    jitter = jitter,
+    get_remote = get_remote,
+}
+
+print("[flare.xyz] ac layer live — silent, rate-limited, hop-on-danger")
+return genv.flare_ac
